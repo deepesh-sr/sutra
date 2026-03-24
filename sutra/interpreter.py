@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from .ast_nodes import (
     Program, Header,
-    IntentStmt, FactStmt, QueryStmt, OfferStmt,
+    IntentStmt, FactStmt, QueryStmt, OfferStmt, CounterStmt,
     AcceptStmt, RejectStmt, CommitStmt, ActStmt,
     Predicate, NamedArg,
     StringVal, NumberVal, BoolVal, NullVal, MapVal, ListVal,
@@ -18,6 +18,8 @@ from .agent import Agent
 from .crypto import (
     sign, commitment_content, offer_content, SutraSignature,
 )
+
+import time as _time
 
 
 class RuntimeError(Exception):
@@ -100,6 +102,8 @@ class Interpreter:
         resolve = self._resolve_value
         fields = {f.key: resolve(f.value) for f in stmt.fields}
         from_agent = meta.get("from", self.agent.agent_id)
+        # v0.7: Calculate expiry timestamp
+        expires_at = _parse_expires(stmt.expires) if stmt.expires else None
         # v0.3: Auto-sign if agent has a keypair
         sig_dict = None
         sig_info = ""
@@ -114,15 +118,57 @@ class Interpreter:
             to_agent=stmt.to_agent,
             fields=fields,
             signature=sig_dict,
+            expires_at=expires_at,
         )
-        self.responses.append(f"[OFFER] id={stmt.offer_id!r} → {stmt.to_agent}{sig_info}")
+        exp_info = f" expires={stmt.expires}" if stmt.expires else ""
+        self.responses.append(f"[OFFER] id={stmt.offer_id!r} → {stmt.to_agent}{exp_info}{sig_info}")
+
+    def _exec_counter(self, stmt: CounterStmt, meta: dict):
+        resolve = self._resolve_value
+        fields = {f.key: resolve(f.value) for f in stmt.fields}
+        from_agent = meta.get("from", self.agent.agent_id)
+        expires_at = _parse_expires(stmt.expires) if stmt.expires else None
+        # Auto-sign counter-offer
+        sig_dict = None
+        sig_info = ""
+        if self.agent.keypair is not None:
+            content = offer_content(stmt.offer_id, from_agent, stmt.to_agent, fields)
+            sig = sign(self.agent.keypair, content)
+            sig_dict = sig.to_dict()
+            sig_info = f" 🔏 {sig.algorithm}:{sig.signature_hex[:12]}..."
+        self.agent.add_offer(
+            offer_id=stmt.offer_id,
+            from_agent=from_agent,
+            to_agent=stmt.to_agent,
+            fields=fields,
+            signature=sig_dict,
+            expires_at=expires_at,
+            counter_to=stmt.original_offer_id,
+        )
+        neg_round = self.agent.offer_ledger[stmt.offer_id].negotiation_round
+        self.responses.append(
+            f"[COUNTER] {stmt.original_offer_id!r} → id={stmt.offer_id!r} "
+            f"(round {neg_round}) → {stmt.to_agent}{sig_info}"
+        )
 
     def _exec_accept(self, stmt: AcceptStmt, meta: dict):
-        ok = self.agent.accept_offer(stmt.offer_id)
+        # v0.7: Resolve conditions if present
+        conditions = None
+        if stmt.conditions:
+            conditions = [
+                {"predicate": c.name, "args": self._pred_args(c)}
+                for c in stmt.conditions
+            ]
+        ok = self.agent.accept_offer(stmt.offer_id, conditions=conditions)
         if ok:
-            self.responses.append(f"[ACCEPT] Offer {stmt.offer_id!r} accepted")
+            cond_info = f" with {len(conditions)} conditions" if conditions else ""
+            self.responses.append(f"[ACCEPT] Offer {stmt.offer_id!r} accepted{cond_info}")
         else:
-            self.responses.append(f"[ACCEPT FAILED] Offer {stmt.offer_id!r} not found or not open")
+            offer = self.agent.offer_ledger.get(stmt.offer_id)
+            if offer and offer.is_expired:
+                self.responses.append(f"[ACCEPT FAILED] Offer {stmt.offer_id!r} expired")
+            else:
+                self.responses.append(f"[ACCEPT FAILED] Offer {stmt.offer_id!r} not found or not open")
 
     def _exec_reject(self, stmt: RejectStmt, meta: dict):
         ok = self.agent.reject_offer(stmt.offer_id, stmt.reason)
@@ -158,6 +204,30 @@ def _fmt_args(args: dict) -> str:
     return ", ".join(f"{k}={v!r}" for k, v in args.items())
 
 
+def _parse_expires(expires_str: str) -> float | None:
+    """Parse an expiry string into a Unix timestamp.
+
+    Supports:
+      - Relative durations: "30s", "5m", "2h", "1d"
+      - Absolute Unix timestamp: "1234567890.0"
+    """
+    if not expires_str:
+        return None
+    s = expires_str.strip().lower()
+    multipliers = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    if s[-1] in multipliers:
+        try:
+            val = float(s[:-1])
+            return _time.time() + val * multipliers[s[-1]]
+        except ValueError:
+            pass
+    # Try absolute timestamp
+    try:
+        return float(expires_str)
+    except ValueError:
+        return None
+
+
 # ── Initialize dispatch tables after class definition ──
 
 Interpreter._DISPATCH = {
@@ -165,6 +235,7 @@ Interpreter._DISPATCH = {
     FactStmt: Interpreter._exec_fact,
     QueryStmt: Interpreter._exec_query,
     OfferStmt: Interpreter._exec_offer,
+    CounterStmt: Interpreter._exec_counter,
     AcceptStmt: Interpreter._exec_accept,
     RejectStmt: Interpreter._exec_reject,
     CommitStmt: Interpreter._exec_commit,

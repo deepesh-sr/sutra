@@ -46,17 +46,36 @@ class Offer:
     from_agent: str
     to_agent: str
     fields: dict[str, Any]
-    status: str = "open"  # open | accepted | rejected
+    status: str = "open"  # open | accepted | rejected | countered | expired
     signature: dict | None = None  # v0.3: SutraSignature.to_dict() or None
     timestamp: float = field(default_factory=time.time)
+    # v0.7: Negotiation features
+    expires_at: float | None = None  # Unix timestamp when offer expires (None = never)
+    counter_to: str | None = None  # Original offer ID if this is a counter-offer
+    conditions: list[dict] | None = None  # Conditions attached to acceptance
+    negotiation_round: int = 0  # Tracks how many rounds of negotiation
 
     @property
     def is_signed(self) -> bool:
         return self.signature is not None
 
+    @property
+    def is_expired(self) -> bool:
+        if self.expires_at is None:
+            return False
+        return time.time() > self.expires_at
+
+    @property
+    def is_counter(self) -> bool:
+        return self.counter_to is not None
+
     def __str__(self):
         sig = " 🔏" if self.is_signed else ""
-        return f"OFFER id={self.offer_id!r} [{self.status}] → {self.to_agent}{sig}"
+        counter = f" ↩counter:{self.counter_to}" if self.is_counter else ""
+        exp = " ⏳" if self.expires_at and not self.is_expired else ""
+        exp = " ⌛expired" if self.is_expired else exp
+        cond = f" [+{len(self.conditions)} conditions]" if self.conditions else ""
+        return f"OFFER id={self.offer_id!r} [{self.status}] → {self.to_agent}{counter}{exp}{cond}{sig}"
 
 
 @dataclass
@@ -132,34 +151,95 @@ class Agent:
         self._log("INTENT", str(intent))
 
     def add_offer(self, offer_id: str, from_agent: str, to_agent: str, fields: dict[str, Any],
-                  signature: dict | None = None):
+                  signature: dict | None = None, expires_at: float | None = None,
+                  counter_to: str | None = None):
+        # Calculate negotiation round from counter chain
+        neg_round = 0
+        if counter_to and counter_to in self.offer_ledger:
+            neg_round = self.offer_ledger[counter_to].negotiation_round + 1
         offer = Offer(
             offer_id=offer_id,
             from_agent=from_agent,
             to_agent=to_agent,
             fields=fields,
             signature=signature,
+            expires_at=expires_at,
+            counter_to=counter_to,
+            negotiation_round=neg_round,
         )
         self.offer_ledger[offer_id] = offer
+        # If this is a counter-offer, mark the original as "countered"
+        if counter_to and counter_to in self.offer_ledger:
+            original = self.offer_ledger[counter_to]
+            if original.status == "open":
+                original.status = "countered"
+                self._log("COUNTERED", f"Offer {counter_to!r} superseded by counter {offer_id!r}")
         self._log("OFFER", str(offer))
 
-    def accept_offer(self, offer_id: str) -> bool:
+    def accept_offer(self, offer_id: str, conditions: list[dict] | None = None) -> bool:
         offer = self.offer_ledger.get(offer_id)
-        if offer is None or offer.status != "open":
-            self._log("ACCEPT_FAIL", f"Offer {offer_id!r} not found or not open")
+        if offer is None:
+            self._log("ACCEPT_FAIL", f"Offer {offer_id!r} not found")
+            return False
+        if offer.status != "open":
+            # Check if expired
+            if offer.is_expired:
+                offer.status = "expired"
+                self._log("ACCEPT_FAIL", f"Offer {offer_id!r} expired")
+                return False
+            self._log("ACCEPT_FAIL", f"Offer {offer_id!r} not open (status={offer.status})")
+            return False
+        # Check expiry before accepting
+        if offer.is_expired:
+            offer.status = "expired"
+            self._log("ACCEPT_FAIL", f"Offer {offer_id!r} expired before acceptance")
             return False
         offer.status = "accepted"
-        self._log("ACCEPT", f"Offer {offer_id!r} accepted")
+        offer.conditions = conditions
+        self._log("ACCEPT", f"Offer {offer_id!r} accepted" +
+                  (f" with {len(conditions)} conditions" if conditions else ""))
         return True
 
     def reject_offer(self, offer_id: str, reason: str | None = None) -> bool:
         offer = self.offer_ledger.get(offer_id)
-        if offer is None or offer.status != "open":
+        if offer is None or offer.status not in ("open", "countered"):
             self._log("REJECT_FAIL", f"Offer {offer_id!r} not found or not open")
+            return False
+        if offer.is_expired:
+            offer.status = "expired"
+            self._log("REJECT_FAIL", f"Offer {offer_id!r} already expired")
             return False
         offer.status = "rejected"
         self._log("REJECT", f"Offer {offer_id!r} rejected" + (f": {reason}" if reason else ""))
         return True
+
+    def expire_offers(self) -> list[str]:
+        """Check all open offers and mark expired ones. Returns list of expired offer IDs."""
+        expired = []
+        for oid, offer in self.offer_ledger.items():
+            if offer.status == "open" and offer.is_expired:
+                offer.status = "expired"
+                expired.append(oid)
+                self._log("EXPIRED", f"Offer {oid!r} expired")
+        return expired
+
+    def get_negotiation_chain(self, offer_id: str) -> list[Offer]:
+        """Trace the full counter-offer chain for an offer."""
+        chain = []
+        # Walk backwards to find the root
+        current_id = offer_id
+        while current_id:
+            offer = self.offer_ledger.get(current_id)
+            if offer is None:
+                break
+            chain.append(offer)
+            current_id = offer.counter_to
+        chain.reverse()
+        # Now walk forward from root to find all counters
+        root_id = chain[0].offer_id if chain else offer_id
+        forward = [o for o in self.offer_ledger.values() if o.counter_to == root_id and o not in chain]
+        chain.extend(forward)
+        return chain
 
     def add_commit(self, predicate: str, args: dict[str, Any], deadline: str | None = None,
                    signature: dict | None = None):
